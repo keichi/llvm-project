@@ -35,7 +35,7 @@ jobs:
       (github.event.pull_request.author_association != 'OWNER')
     steps:
       - name: Checkout Automation Script
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
         with:
           sparse-checkout: llvm/utils/git/
           ref: main
@@ -43,7 +43,7 @@ jobs:
       - name: Setup Automation Script
         working-directory: ./llvm/utils/git/
         run: |
-          pip install -r requirements.txt
+          pip install --require-hashes -r requirements.txt
 
       - name: Greet Author
         working-directory: ./llvm/utils/git/
@@ -67,7 +67,7 @@ jobs:
       github.event.pull_request.draft == false &&
       github.event.pull_request.commits < 10
     steps:
-      - uses: actions/labeler@v6
+      - uses: actions/labeler@v4
         with:
           configuration-path: .github/new-prs-labeler.yml
           # workaround for https://github.com/actions/labeler/issues/112
