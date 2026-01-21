@@ -275,9 +275,9 @@ Value &VPBuilder::createSelect(Value &OnTrue, Value &OnFalse, Value &Mask,
                                Value &Pivot, Twine Name) {
   auto D = VPIntrinsic::getDeclarationForParams(
       &getModule(), Intrinsic::vp_select, OnTrue.getType(),
-      {&OnTrue, &OnFalse, &Mask, &Pivot});
+      {&Mask, &OnTrue, &OnFalse, &Pivot});
   return *Builder.CreateCall(
-      D, {&OnTrue, &OnFalse, &Mask, &Pivot, &RequestEVL()}, Name);
+      D, {&Mask, &OnTrue, &OnFalse, &Pivot}, Name);
 }
 
 } // namespace llvm

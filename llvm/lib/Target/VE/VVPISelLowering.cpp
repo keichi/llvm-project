@@ -2142,6 +2142,14 @@ SDValue VETargetLowering::lowerVPToVVP(SDValue Op, SelectionDAG &DAG,
     OpVec.push_back(Mask);
     OpVec.push_back(AVL);
 
+  } else if (*VVPOC == VEISD::VVP_SELECT) {
+    // vp_select has (mask, on_true, on_false, vlen) but VVP_SELECT expects
+    // (on_true, on_false, mask, pivot).
+    OpVec.push_back(Op->getOperand(1)); // on_true
+    OpVec.push_back(Op->getOperand(2)); // on_false
+    OpVec.push_back(Mask);
+    OpVec.push_back(AVL);
+
   } else {
     // Default.
     unsigned NumOps = Op.getNumOperands();
