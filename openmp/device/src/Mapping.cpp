@@ -136,7 +136,13 @@ uint32_t mapping::getNumberOfWarpsInBlock() {
 }
 
 uint32_t mapping::getNumberOfBlocksInKernel(int32_t Dim) {
+#ifdef __AMDGPU__
+  // Read hidden_block_count from the COV5 implicit arguments instead of
+  // dividing the grid size in the dispatch packet, which is in host memory.
+  return ((const Constant<uint32_t> *)__builtin_amdgcn_implicitarg_ptr())[Dim];
+#else
   return __gpu_num_blocks(Dim);
+#endif
 }
 
 uint32_t mapping::getNumberOfProcessorElements() {
