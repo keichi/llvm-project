@@ -551,11 +551,13 @@ struct AMDGPUMemoryManagerTy : public DeviceAllocatorTy {
   AMDGPUMemoryManagerTy(AMDGPUPluginTy &Plugin)
       : Plugin(Plugin), MemoryPool(nullptr), MemoryManager(nullptr) {}
 
-  /// Initialize the memory manager from a memory pool.
-  Error init(AMDGPUMemoryPoolTy &MemoryPool) {
+  /// Initialize the memory manager from a memory pool. If \p HostAgent is
+  /// valid, it is also allowed to access the allocations.
+  Error init(AMDGPUMemoryPoolTy &MemoryPool, hsa_agent_t HostAgent = {0}) {
     const uint32_t Threshold = 1 << 30;
     this->MemoryManager = new MemoryManagerTy(*this, Threshold);
     this->MemoryPool = &MemoryPool;
+    this->HostAgent = HostAgent;
     return Plugin::success();
   }
 
@@ -589,6 +591,9 @@ struct AMDGPUMemoryManagerTy : public DeviceAllocatorTy {
     return Plugin::success();
   }
 
+  /// Get the plugin that owns this memory manager.
+  AMDGPUPluginTy &getPlugin() const { return Plugin; }
+
   /// Release an allocation to be reused.
   Error deallocate(void *Ptr) {
     if (MemoryManager->free(Ptr))
@@ -617,6 +622,9 @@ private:
 
   /// Reference to the actual memory manager.
   MemoryManagerTy *MemoryManager;
+
+  /// Host agent that is allowed to access the allocations, if any.
+  hsa_agent_t HostAgent = {0};
 };
 
 /// Largest size for direct host to device transfer.
@@ -2385,9 +2393,12 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
         OMPX_StreamBusyWait("LIBOMPTARGET_AMDGPU_STREAM_BUSYWAIT", 2000000),
         OMPX_UseMultipleSdmaEngines(
             "LIBOMPTARGET_AMDGPU_USE_MULTIPLE_SDMA_ENGINES", false),
-        OMPX_ApuMaps("OMPX_APU_MAPS", false), AMDGPUStreamManager(*this, Agent),
-        AMDGPUEventManager(*this), AMDGPUSignalManager(*this), Agent(Agent),
-        HostDevice(HostDevice) {}
+        OMPX_ApuMaps("OMPX_APU_MAPS", false),
+        OMPX_DeviceKernelArgs("LIBOMPTARGET_AMDGPU_DEVICE_KERNARGS", true),
+        AMDGPUStreamManager(*this, Agent), AMDGPUEventManager(*this),
+        AMDGPUSignalManager(*this), Agent(Agent), HostDevice(HostDevice),
+        DeviceArgsMemoryManager(HostDevice.getArgsMemoryManager().getPlugin()) {
+  }
 
   ~AMDGPUDeviceTy() {}
 
@@ -2521,6 +2532,18 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
     if (auto Err = checkIfAPU())
       return Err;
 
+    // Place the kernel arguments in device memory on gfx94x and gfx95x when
+    // the host can write it, as HIP does. The kernarg pool is uncached on the
+    // GPU, so every wavefront reading the arguments would access host memory.
+    StringRef Arch(ComputeUnitKind);
+    if (OMPX_DeviceKernelArgs && HostWritesDeviceMemory &&
+        (Arch.starts_with("gfx94") || Arch.starts_with("gfx95"))) {
+      if (auto Err = DeviceArgsMemoryManager.init(*CoarseGrainedMemoryPools[0],
+                                                  HostDevice.getAgent()))
+        return Err;
+      UseDeviceKernelArgs = true;
+    }
+
     // Retrieve the size of the group memory.
     for (const auto *Pool : AllMemoryPools) {
       if (Pool->isGroup()) {
@@ -2642,6 +2665,10 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
 
     if (auto Err = AMDGPUSignalManager.deinit())
       return Err;
+
+    if (UseDeviceKernelArgs)
+      if (auto Err = DeviceArgsMemoryManager.deinit())
+        return Err;
 
     // Invalidate agent reference.
     Agent = {0};
@@ -3688,6 +3715,20 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
   /// Get the host device nearest to the device.
   AMDHostDeviceTy &getHostDevice() { return HostDevice; }
 
+  /// Get the memory manager for kernel arguments.
+  AMDGPUMemoryManagerTy &getArgsMemoryManager() {
+    return UseDeviceKernelArgs ? DeviceArgsMemoryManager
+                               : HostDevice.getArgsMemoryManager();
+  }
+
+  /// Copy the kernel arguments to a buffer from getArgsMemoryManager().
+  void publishKernelArgs(void *Dst, const void *Src, size_t Size) const {
+    if (UseDeviceKernelArgs)
+      publishToDeviceMemory(Dst, Src, Size, HostLinkIsXGMI);
+    else
+      std::memcpy(Dst, Src, Size);
+  }
+
   /// Get the signal manager.
   AMDGPUSignalManagerTy &getSignalManager() { return AMDGPUSignalManager; }
 
@@ -3830,6 +3871,9 @@ private:
   /// automatic zero-copy behavior on non-APU GPUs.
   BoolEnvar OMPX_ApuMaps;
 
+  /// Envar to place kernel arguments in device memory when supported.
+  BoolEnvar OMPX_DeviceKernelArgs;
+
   /// Stream manager for AMDGPU streams.
   AMDGPUStreamManagerTy AMDGPUStreamManager;
 
@@ -3867,6 +3911,12 @@ private:
 
   /// Whether the host reaches this device's memory over XGMI rather than PCIe.
   bool HostLinkIsXGMI = false;
+
+  /// Memory manager for kernel arguments in device memory.
+  AMDGPUMemoryManagerTy DeviceArgsMemoryManager;
+
+  /// Whether kernel arguments are placed in device memory.
+  bool UseDeviceKernelArgs = false;
 
   /// The current size of the stack that will be used in cases where it could
   /// not be statically determined.
@@ -4543,11 +4593,18 @@ Error AMDGPUKernelTy::launchImpl(GenericDeviceTy &GenericDevice,
 
   AMDGPUDeviceTy &AMDGPUDevice = static_cast<AMDGPUDeviceTy &>(GenericDevice);
   AMDGPUMemoryManagerTy &ArgsMemoryManager =
-      AMDGPUDevice.getHostDevice().getArgsMemoryManager();
+      AMDGPUDevice.getArgsMemoryManager();
 
   void *AllArgs = nullptr;
   if (auto Err = ArgsMemoryManager.allocate(ArgsSize, &AllArgs))
     return Err;
+
+  // Prepare the arguments in a local buffer and copy them to the kernarg buffer
+  // at once, since it may be in device memory. Use uint64_t elements to keep
+  // the implicit arguments aligned. The implicit arguments alone take 256
+  // bytes, so keep 1 KiB on the stack.
+  SmallVector<uint64_t, 128> ArgsStorage(llvm::divideCeil(ArgsSize, 8));
+  char *Args = reinterpret_cast<char *>(ArgsStorage.data());
 
   uint64_t StackSize;
   if (auto Err = GenericDevice.getDeviceStackSize(StackSize))
@@ -4568,7 +4625,7 @@ Error AMDGPUKernelTy::launchImpl(GenericDeviceTy &GenericDevice,
 
     for (size_t I = 0; I < NumArgs; I++) {
       auto [Offset, Size] = ArgMDs[I];
-      std::memcpy(utils::advancePtr(AllArgs, Offset), LaunchArgs.Args[I], Size);
+      std::memcpy(Args + Offset, LaunchArgs.Args[I], Size);
     }
 
     auto [Offset, Size] = ArgMDs[NumArgs - 1];
@@ -4583,12 +4640,11 @@ Error AMDGPUKernelTy::launchImpl(GenericDeviceTy &GenericDevice,
       llvm::alignTo(ExplicitEnd, alignof(hsa_utils::AMDGPUImplicitArgsTy));
   if (ArgsSize > ImplArgsOffset) {
     hsa_utils::AMDGPUImplicitArgsTy *ImplArgs =
-        reinterpret_cast<hsa_utils::AMDGPUImplicitArgsTy *>(
-            utils::advancePtr(AllArgs, ImplArgsOffset));
+        reinterpret_cast<hsa_utils::AMDGPUImplicitArgsTy *>(Args +
+                                                            ImplArgsOffset);
 
     // Set the COV5+ implicit arguments to the appropriate values if present.
     uint64_t ImplArgsSize = ArgsSize - ImplArgsOffset;
-    std::memset(ImplArgs, 0, ImplArgsSize);
 
     using ImplArgsTy = hsa_utils::AMDGPUImplicitArgsTy;
     hsa_utils::initImplArg(ImplArgs, &ImplArgsTy::BlockCountX, ImplArgsSize,
@@ -4616,6 +4672,9 @@ Error AMDGPUKernelTy::launchImpl(GenericDeviceTy &GenericDevice,
 
   // HSA requires the group segment size to include both static and dynamic.
   uint32_t TotalBlockMemSize = getStaticBlockMemSize() + DynBlockMemSize;
+
+  if (ArgsSize > 0)
+    AMDGPUDevice.publishKernelArgs(AllArgs, Args, ArgsSize);
 
   // Push the kernel launch into the stream.
   return Stream->pushKernelLaunch(*this, AllArgs, NumThreads, NumBlocks,
@@ -4724,6 +4783,8 @@ Expected<void *> AMDGPUMemoryManagerTy::allocate(size_t Size, void *HstPtr,
   llvm::copy_if(
       Plugin.getKernelAgents(), std::back_inserter(Agents),
       [&](hsa_agent_t Agent) { return MemoryPool->canAccess(Agent); });
+  if (HostAgent.handle)
+    Agents.push_back(HostAgent);
 
   // Allow all valid kernel agents to access the allocation.
   if (auto Err = MemoryPool->enableAccess(Ptr, Size, Agents))
